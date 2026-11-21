@@ -3,9 +3,35 @@ set -euo pipefail
 
 # -----------------------
 # 彩色输出函数
-info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
-warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
-err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
+status_line() {
+    local color="$1" label="$2"
+    shift 2
+    if [[ -t 1 && -z "${NO_COLOR+x}" && "${TERM:-dumb}" != dumb ]]; then
+        printf '\033[1;%sm%s\033[0m %s\n' "$color" "$label" "$*"
+    else
+        printf '%s %s\n' "$label" "$*"
+    fi
+}
+
+info() { status_line 34 '[信息]' "$@"; }
+ok()   { status_line 32 '[成功]' "$@"; }
+warn() { status_line 33 '[警告]' "$@"; }
+err()  { status_line 31 '[失败]' "$@" >&2; }
+
+step() {
+    printf '\n'
+    status_line 34 "[$1/5]" "$2"
+}
+
+field() { printf '    %s  %s\n' "$1" "$2"; }
+
+show_protocol_ports() {
+    if $ENABLE_SS; then field 'Shadowsocks' "$PORT_SS"; fi
+    if $ENABLE_HY2; then field 'Hysteria2' "$PORT_HY2/UDP"; fi
+    if $ENABLE_TUIC; then field 'TUIC' "$PORT_TUIC/UDP"; fi
+    if $ENABLE_REALITY; then field 'VLESS Reality' "$PORT_REALITY/TCP"; fi
+    if $ENABLE_ANYTLS; then field 'AnyTLS Reality' "$PORT_ANYTLS/TCP"; fi
+}
 
 # -----------------------
 # 检测系统类型
@@ -30,8 +56,9 @@ detect_os() {
     fi
 }
 
+printf '\n  Sing-box 安装向导\n  ────────────────────────────────────\n'
+step 1 "检查运行环境"
 detect_os
-info "检测到系统: $OS (${OS_ID:-unknown})"
 
 # -----------------------
 # 检查 root 权限
@@ -44,6 +71,7 @@ check_root() {
 }
 
 check_root
+ok "${OS_ID:-unknown} · $(uname -m) · root"
 
 # -----------------------
 # 安装依赖
@@ -52,24 +80,24 @@ install_deps() {
     
     case "$OS" in
         alpine)
-            apk update || { err "apk update 失败"; exit 1; }
+            apk update || { err "apk update 失败"; return 1; }
             apk add --no-cache bash curl ca-certificates openssl openrc jq || {
                 err "依赖安装失败"
-                exit 1
+                return 1
             }
             ;;
         debian)
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update -y || { err "apt update 失败"; exit 1; }
+            apt-get update -y || { err "apt update 失败"; return 1; }
             apt-get install -y curl ca-certificates openssl jq || {
                 err "依赖安装失败"
-                exit 1
+                return 1
             }
             ;;
         redhat)
             yum install -y curl ca-certificates openssl jq || {
                 err "依赖安装失败"
-                exit 1
+                return 1
             }
             ;;
         *)
@@ -80,7 +108,6 @@ install_deps() {
     info "依赖安装完成"
 }
 
-install_deps
 
 # -----------------------
 # 工具函数
@@ -111,11 +138,11 @@ rand_uuid() {
 
 # -----------------------
 # 配置节点名称后缀
-echo "请输入节点名称(留空则默认议名):"
+step 2 "选择并确认安装配置"
+echo "请输入节点名称（留空使用默认名称）"
 read -r user_name
 if [[ -n "$user_name" ]]; then
     suffix="-${user_name}"
-    echo "$suffix" > /root/node_names.txt
 else
     suffix=""
 fi
@@ -156,15 +183,6 @@ select_protocols() {
         exit 1
     fi
     
-    # 保存协议选择到文件（确保持久化）
-    mkdir -p /etc/sing-box
-    cat > /etc/sing-box/.protocols <<EOF
-ENABLE_SS=$ENABLE_SS
-ENABLE_HY2=$ENABLE_HY2
-ENABLE_TUIC=$ENABLE_TUIC
-ENABLE_REALITY=$ENABLE_REALITY
-ENABLE_ANYTLS=$ENABLE_ANYTLS
-EOF
     
     info "已选择协议:"
     $ENABLE_SS && echo "  - Shadowsocks"
@@ -181,8 +199,6 @@ EOF
     export ENABLE_ANYTLS
 }
 
-# 创建配置目录
-mkdir -p /etc/sing-box
 select_protocols
 
 # -----------------------
@@ -234,19 +250,6 @@ else
     REALITY_SNI="addons.mozilla.org"
 fi
 
-# 将用户选择写入缓存
-mkdir -p /etc/sing-box
-# preserve existing cache if any (append/overwrite relevant keys)
-# 最简单直接：在后面 create_config 也会写入 .config_cache，先写初始值以便中间步骤可读取
-echo "CUSTOM_IP=$CUSTOM_IP" > /etc/sing-box/.config_cache.tmp || true
-echo "REALITY_SNI=$REALITY_SNI" >> /etc/sing-box/.config_cache.tmp || true
-# 保留其他可能已有的缓存条目（若存在老的 .config_cache），把新临时与旧文件合并（保新值覆盖旧值）
-if [ -f /etc/sing-box/.config_cache ]; then
-    # 将旧文件中不在新文件内的行追加
-    awk 'FNR==NR{a[$1]=1;next} {split($0,k,"="); if(!(k[1] in a)) print $0}' /etc/sing-box/.config_cache.tmp /etc/sing-box/.config_cache >> /etc/sing-box/.config_cache.tmp2 || true
-    mv /etc/sing-box/.config_cache.tmp2 /etc/sing-box/.config_cache.tmp || true
-fi
-mv /etc/sing-box/.config_cache.tmp /etc/sing-box/.config_cache || true
 
 # -----------------------
 # 生成随机端口
@@ -267,93 +270,84 @@ rand_uuid() {
 # -----------------------
 # 配置端口和密码
 get_config() {
-    info "开始配置端口和密码..."
     
     if $ENABLE_SS; then
-        info "=== 配置 Shadowsocks (SS) ==="
+        printf '\n  %s\n' "Shadowsocks (SS)"
         if [ -n "${SINGBOX_PORT_SS:-}" ]; then
             PORT_SS="$SINGBOX_PORT_SS"
         else
             read -p "请输入 SS 端口(留空则随机 10000-60000): " USER_PORT_SS
             PORT_SS="${USER_PORT_SS:-$(rand_port)}"
         fi
-        PSK_SS=$(rand_pass)
-        info "SS 端口: $PORT_SS"
-        info "SS 加密方式: $SS_METHOD"
-        info "SS 密码已自动生成"
     fi
 
     if $ENABLE_HY2; then
-        info "=== 配置 Hysteria2 (HY2) ==="
+        printf '\n  %s\n' "Hysteria2 (HY2)"
         if [ -n "${SINGBOX_PORT_HY2:-}" ]; then
             PORT_HY2="$SINGBOX_PORT_HY2"
         else
             read -p "请输入 HY2 端口(留空则随机 10000-60000): " USER_PORT_HY2
             PORT_HY2="${USER_PORT_HY2:-$(rand_port)}"
         fi
-        PSK_HY2=$(rand_pass)
-        info "HY2 端口: $PORT_HY2"
-        info "HY2 密码已自动生成"
     fi
 
     if $ENABLE_TUIC; then
-        info "=== 配置 TUIC ==="
+        printf '\n  %s\n' "TUIC"
         if [ -n "${SINGBOX_PORT_TUIC:-}" ]; then
             PORT_TUIC="$SINGBOX_PORT_TUIC"
         else
             read -p "请输入 TUIC 端口(留空则随机 10000-60000): " USER_PORT_TUIC
             PORT_TUIC="${USER_PORT_TUIC:-$(rand_port)}"
         fi
-        PSK_TUIC=$(rand_pass)
-        UUID_TUIC=$(rand_uuid)
-        info "TUIC 端口: $PORT_TUIC"
-        info "TUIC UUID 和密码已自动生成"
     fi
 
     if $ENABLE_REALITY; then
-        info "=== 配置 VLESS Reality ==="
+        printf '\n  %s\n' "VLESS Reality"
         if [ -n "${SINGBOX_PORT_REALITY:-}" ]; then
             PORT_REALITY="$SINGBOX_PORT_REALITY"
         else
             read -p "请输入 VLESS Reality 端口(留空则随机 10000-60000): " USER_PORT_REALITY
             PORT_REALITY="${USER_PORT_REALITY:-$(rand_port)}"
         fi
-        UUID=$(rand_uuid)
-        info "VLESS Reality 端口: $PORT_REALITY"
-        info "VLESS Reality UUID 已自动生成"
     fi
     
     if $ENABLE_ANYTLS; then
-    info "=== 配置 AnyTLS Reality ==="
-    if [ -n "${SINGBOX_PORT_ANYTLS:-}" ]; then
-        PORT_ANYTLS="$SINGBOX_PORT_ANYTLS"
-    else
-        read -p "请输入 AnyTLS Reality 端口(留空则随机 10000-60000): " USER_PORT_ANYTLS
-        PORT_ANYTLS="${USER_PORT_ANYTLS:-$(rand_port)}"
+        printf '\n  %s\n' "AnyTLS Reality"
+        if [ -n "${SINGBOX_PORT_ANYTLS:-}" ]; then
+            PORT_ANYTLS="$SINGBOX_PORT_ANYTLS"
+        else
+            read -p "请输入 AnyTLS Reality 端口(留空则随机 10000-60000): " USER_PORT_ANYTLS
+            PORT_ANYTLS="${USER_PORT_ANYTLS:-$(rand_port)}"
+        fi
     fi
-
-    ANYTLS_USER=$(openssl rand -hex 4)
-    ANYTLS_PSK=$(openssl rand -base64 16)
-
-    info "AnyTLS Reality 端口: $PORT_ANYTLS"
-    info "AnyTLS Reality 用户名: $ANYTLS_USER"
-    info "AnyTLS Reality 密码已自动生成"
-    fi
-
-    info "配置完成，继续安装..."
 }
 
 get_config
 
+printf '\n  安装配置\n'
+field '连接地址' "${CUSTOM_IP:-安装后自动检测公网 IPv4}"
+field '节点名称' "${user_name:-默认名称}"
+show_protocol_ports
+if $ENABLE_SS; then field 'SS 加密' "$SS_METHOD"; fi
+if $ENABLE_REALITY || $ENABLE_ANYTLS; then field 'Reality SNI' "$REALITY_SNI"; fi
+if [[ -f /etc/sing-box/config.json ]]; then
+    warn "现有配置将由通过校验的新配置替换，随后会重启服务。"
+fi
+printf '\n继续安装？[y/N] '
+if ! IFS= read -r confirm || [[ ! "$confirm" =~ ^([Yy]|[Yy][Ee][Ss])$ ]]; then
+    info "已取消安装"
+    exit 0
+fi
+
 # -----------------------
 # 安装 sing-box
 install_singbox() {
-    info "开始安装 sing-box..."
 
     if command -v sing-box >/dev/null 2>&1; then
         CURRENT_VERSION=$(sing-box version 2>/dev/null | head -1 || echo "unknown")
         warn "检测到已安装 sing-box: $CURRENT_VERSION"
-        read -p "是否重新安装?(y/N): " REINSTALL
+        printf '是否重新安装？[y/N] '
+        IFS= read -r REINSTALL || return 1
         if [[ ! "$REINSTALL" =~ ^[Yy]$ ]]; then
             info "跳过 sing-box 安装"
             return 0
@@ -363,34 +357,64 @@ install_singbox() {
     case "$OS" in
         alpine)
             info "使用 Edge 仓库安装 sing-box"
-            apk update || { err "apk update 失败"; exit 1; }
-            apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box || {
+            apk update >> "$install_log" 2>&1 || { err "apk update 失败"; return 1; }
+            apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box >> "$install_log" 2>&1 || {
                 err "sing-box 安装失败"
-                exit 1
+                return 1
             }
             ;;
         debian|redhat)
-            bash <(curl -fsSL https://sing-box.app/install.sh) || {
+            local installer
+            installer=$(mktemp) || return 1
+            if ! { curl -fsSL https://sing-box.app/install.sh -o "$installer" && bash "$installer"; } >> "$install_log" 2>&1; then
+                rm -f "$installer"
                 err "sing-box 安装失败"
-                exit 1
-            }
+                return 1
+            fi
+            rm -f "$installer"
             ;;
         *)
             err "未支持的系统,无法安装 sing-box"
-            exit 1
+            return 1
             ;;
     esac
 
     if ! command -v sing-box >/dev/null 2>&1; then
         err "sing-box 安装后未找到可执行文件"
-        exit 1
+        return 1
     fi
 
     INSTALLED_VERSION=$(sing-box version 2>/dev/null | head -1 || echo "unknown")
-    info "sing-box 安装成功: $INSTALLED_VERSION"
+    ok "sing-box 已安装：$INSTALLED_VERSION"
 }
 
-install_singbox
+step 3 "安装系统依赖和 sing-box"
+install_log=$(mktemp /var/log/sing-box-install.XXXXXXXX.log)
+info "安装系统依赖，详细输出写入 $install_log"
+if ! install_deps >> "$install_log" 2>&1; then
+    err "依赖安装失败。日志：$install_log"
+    tail -n 15 "$install_log" >&2
+    exit 1
+fi
+ok "系统依赖就绪"
+if ! install_singbox; then
+    err "sing-box 安装失败。日志：$install_log"
+    tail -n 15 "$install_log" >&2
+    exit 1
+fi
+
+step 4 "生成并校验配置"
+if $ENABLE_SS; then PSK_SS=$(rand_pass); fi
+if $ENABLE_HY2; then PSK_HY2=$(rand_pass); fi
+if $ENABLE_TUIC; then
+    PSK_TUIC=$(rand_pass)
+    UUID_TUIC=$(rand_uuid)
+fi
+if $ENABLE_REALITY; then UUID=$(rand_uuid); fi
+if $ENABLE_ANYTLS; then
+    ANYTLS_USER=$(openssl rand -hex 4)
+    ANYTLS_PSK=$(openssl rand -base64 16)
+fi
 
 # -----------------------
 # 生成 Reality 密钥对（必须在 sing-box 安装之后）
@@ -629,7 +653,9 @@ INBOUND_ANYTLS
     fi
 
     # 生成最终配置
-    cat > "$CONFIG_PATH" <<'CONFIG_HEAD'
+    local pending_config
+    pending_config=$(mktemp "$(dirname "$CONFIG_PATH")/.config.XXXXXXXX.json")
+    cat > "$pending_config" <<'CONFIG_HEAD'
 {
   "log": {
     "level": "info",
@@ -644,9 +670,9 @@ INBOUND_ANYTLS
   "inbounds": [
 CONFIG_HEAD
     
-    cat "$TEMP_INBOUNDS" >> "$CONFIG_PATH"
+    cat "$TEMP_INBOUNDS" >> "$pending_config"
     
-    cat >> "$CONFIG_PATH" <<'CONFIG_TAIL'
+    cat >> "$pending_config" <<'CONFIG_TAIL'
   ],
   "outbounds": [
     {
@@ -659,9 +685,26 @@ CONFIG_TAIL
 
     rm -f "$TEMP_INBOUNDS"
 
-    sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1 \
-       && info "配置文件验证通过" \
-       || warn "配置文件验证失败,但继续执行"
+    if ! sing-box check -c "$pending_config" >> "$install_log" 2>&1; then
+        rm -f "$pending_config"
+        err "新配置校验失败。日志：$install_log"
+        tail -n 15 "$install_log" >&2
+        exit 1
+    fi
+    mv -f "$pending_config" "$CONFIG_PATH"
+    ok "配置校验通过：$CONFIG_PATH"
+
+    # 保存协议选择到文件（确保持久化）
+    cat > /etc/sing-box/.protocols <<EOF
+ENABLE_SS=$ENABLE_SS
+ENABLE_HY2=$ENABLE_HY2
+ENABLE_TUIC=$ENABLE_TUIC
+ENABLE_REALITY=$ENABLE_REALITY
+ENABLE_ANYTLS=$ENABLE_ANYTLS
+EOF
+    if [[ -n "$suffix" ]]; then
+        printf '%s\n' "$suffix" > /root/node_names.txt
+    fi
 
     # 保存配置缓存（追加/覆盖）
     cat > /etc/sing-box/.config_cache <<CACHEEOF
@@ -713,7 +756,7 @@ CACHEEOF
 # 调用配置生成
 create_config
 
-info "配置生成完成，准备设置服务..."
+step 5 "配置并启动服务"
 
 # -----------------------
 # 设置服务
@@ -759,7 +802,7 @@ OPENRC
         
         sleep 2
         if rc-service sing-box status >/dev/null 2>&1; then
-            info "✅ OpenRC 服务已启动"
+            ok "OpenRC 服务正在运行"
         else
             err "服务状态异常"
             exit 1
@@ -799,7 +842,7 @@ SYSTEMD
         
         sleep 2
         if systemctl is-active sing-box >/dev/null 2>&1; then
-            info "✅ Systemd 服务已启动"
+            ok "Systemd 服务正在运行"
         else
             err "服务状态异常"
             exit 1
@@ -853,7 +896,7 @@ generate_uris() {
         ss_encoded=$(printf "%s" "$ss_userinfo" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         ss_b64=$(printf "%s" "$ss_userinfo" | base64 -w0 2>/dev/null || printf "%s" "$ss_userinfo" | base64 | tr -d '\n')
 
-        echo "=== Shadowsocks (SS) ==="
+        printf '  %s\n' "Shadowsocks (SS)"
         echo "ss://${ss_encoded}@${host}:${PORT_SS}#ss${suffix}"
         echo "ss://${ss_b64}@${host}:${PORT_SS}#ss${suffix}"
         echo ""
@@ -861,20 +904,20 @@ generate_uris() {
     
     if $ENABLE_HY2; then
         hy2_encoded=$(printf "%s" "$PSK_HY2" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
-        echo "=== Hysteria2 (HY2) ==="
+        printf '  %s\n' "Hysteria2 (HY2)"
         echo "hy2://${hy2_encoded}@${host}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${suffix}"
         echo ""
     fi
 
     if $ENABLE_TUIC; then
         tuic_encoded=$(printf "%s" "$PSK_TUIC" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
-        echo "=== TUIC ==="
+        printf '  %s\n' "TUIC"
         echo "tuic://${UUID_TUIC}:${tuic_encoded}@${host}:${PORT_TUIC}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${suffix}"
         echo ""
     fi
     
     if $ENABLE_REALITY; then
-        echo "=== VLESS Reality ==="
+        printf '  %s\n' "VLESS Reality"
         echo "vless://${UUID}@${host}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#reality${suffix}"
         echo ""
     fi
@@ -882,55 +925,13 @@ generate_uris() {
     if $ENABLE_ANYTLS; then
         anytls_user_encoded=$(printf "%s" "$ANYTLS_USER" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         anytls_pass_encoded=$(printf "%s" "$ANYTLS_PSK" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
-        echo "=== AnyTLS Reality ==="
+        printf '  %s\n' "AnyTLS Reality"
         echo "anytls://${anytls_pass_encoded}@${host}:${PORT_ANYTLS}/?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#anytls${suffix}"
         echo ""
     fi
 }
 
 # -----------------------
-# 最终输出
-echo ""
-echo "=========================================="
-info "🎉 Sing-box 部署完成!"
-echo "=========================================="
-echo ""
-info "📋 配置信息:"
-$ENABLE_SS && echo "   SS 端口: $PORT_SS | 密码: $PSK_SS | 加密: $SS_METHOD"
-$ENABLE_HY2 && echo "   HY2 端口: $PORT_HY2 | 密码: $PSK_HY2"
-$ENABLE_TUIC && echo "   TUIC 端口: $PORT_TUIC | UUID: $UUID_TUIC | 密码: $PSK_TUIC"
-$ENABLE_REALITY && echo "   Reality 端口: $PORT_REALITY | UUID: $UUID"
-$ENABLE_ANYTLS && echo "   AnyTLS 端口: $PORT_ANYTLS | 用户: $ANYTLS_USER | 密码: $ANYTLS_PSK"
-echo "   服务器: $PUB_IP"
-echo "   Reality server_name(SNI): ${REALITY_SNI:-addons.mozilla.org}"
-echo ""
-info "📂 文件位置:"
-echo "   配置: $CONFIG_PATH"
-($ENABLE_HY2 || $ENABLE_TUIC) && echo "   证书: /etc/sing-box/certs/"
-echo "   服务: $SERVICE_PATH"
-echo ""
-info "📜 客户端链接:"
-generate_uris | while IFS= read -r line; do
-    echo "   $line"
-done
-echo ""
-info "🔧 管理命令:"
-if [ "$OS" = "alpine" ]; then
-    echo "   启动: rc-service sing-box start"
-    echo "   停止: rc-service sing-box stop"
-    echo "   重启: rc-service sing-box restart"
-    echo "   状态: rc-service sing-box status"
-    echo "   日志: tail -f /var/log/sing-box.log"
-else
-    echo "   启动: systemctl start sing-box"
-    echo "   停止: systemctl stop sing-box"
-    echo "   重启: systemctl restart sing-box"
-    echo "   状态: systemctl status sing-box"
-    echo "   日志: journalctl -u sing-box -f"
-fi
-echo ""
-echo "=========================================="
-
 # -----------------------
 # 创建 sb 管理脚本
 SB_PATH="/usr/local/bin/sb"
@@ -940,9 +941,19 @@ cat > "$SB_PATH" <<'SB_SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
 
-info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
-warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
-err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
+status_line() {
+    local color="$1" label="$2"
+    shift 2
+    if [[ -t 1 && -z "${NO_COLOR+x}" && "${TERM:-dumb}" != dumb ]]; then
+        printf '\033[1;%sm%s\033[0m %s\n' "$color" "$label" "$*"
+    else
+        printf '%s %s\n' "$label" "$*"
+    fi
+}
+
+info() { status_line 34 '[信息]' "$@"; }
+warn() { status_line 33 '[警告]' "$@"; }
+err()  { status_line 31 '[失败]' "$@" >&2; }
 
 CONFIG_PATH="/etc/sing-box/config.json"
 CACHE_FILE="/etc/sing-box/.config_cache"
@@ -1578,88 +1589,81 @@ RELAY_EOF
 show_menu() {
     read_config 2>/dev/null || true
     
-    cat <<'MENU'
-
-==========================
- Sing-box 管理面板 (快速指令sb)
-==========================
-1) 查看协议链接
-2) 查看配置文件路径
-3) 编辑配置文件
-MENU
+    printf '\n  ────────────────────────────────────\n'
+    status_line 34 'Sing-box' '管理面板'
+    printf '  ────────────────────────────────────\n\n'
+    printf '  %s\n' '1) 查看协议链接' '2) 查看配置文件路径' '3) 编辑配置文件'
 
     # 构建协议重置选项映射
     declare -g -A MENU_MAP
     local option=4
     
     if [ "${ENABLE_SS:-false}" = "true" ]; then
-        echo "$option) 重置 SS 端口"
+        printf '  %s\n' "$option) 重置 SS 端口"
         MENU_MAP[$option]="reset_ss"
         option=$((option + 1))
     fi
     
     if [ "${ENABLE_HY2:-false}" = "true" ]; then
-        echo "$option) 重置 HY2 端口"
+        printf '  %s\n' "$option) 重置 HY2 端口"
         MENU_MAP[$option]="reset_hy2"
         option=$((option + 1))
     fi
     
     if [ "${ENABLE_TUIC:-false}" = "true" ]; then
-        echo "$option) 重置 TUIC 端口"
+        printf '  %s\n' "$option) 重置 TUIC 端口"
         MENU_MAP[$option]="reset_tuic"
         option=$((option + 1))
     fi
     
     if [ "${ENABLE_REALITY:-false}" = "true" ]; then
-        echo "$option) 重置 Vless Reality 端口"
+        printf '  %s\n' "$option) 重置 Vless Reality 端口"
         MENU_MAP[$option]="reset_reality"
         option=$((option + 1))
     fi
     
     if [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
-        echo "$option) 重置 AnyTLS Reality 端口"
+        printf '  %s\n' "$option) 重置 AnyTLS Reality 端口"
         MENU_MAP[$option]="reset_anytls"
         option=$((option + 1))
     fi
 
     # 固定功能选项
     MENU_MAP[$option]="start"
-    echo "$option) 启动服务"
+    printf '  %s\n' "$option) 启动服务"
     option=$((option + 1))
     
     MENU_MAP[$option]="stop"
-    echo "$((option))) 停止服务"
+    printf '  %s\n' "$option) 停止服务"
     option=$((option + 1))
     
     MENU_MAP[$option]="restart"
-    echo "$((option))) 重启服务"
+    printf '  %s\n' "$option) 重启服务"
     option=$((option + 1))
     
     MENU_MAP[$option]="status"
-    echo "$((option))) 查看状态"
+    printf '  %s\n' "$option) 查看状态"
     option=$((option + 1))
     
     MENU_MAP[$option]="update"
-    echo "$((option))) 更新 sing-box"
+    printf '  %s\n' "$option) 更新 sing-box"
     option=$((option + 1))
     
     MENU_MAP[$option]="relay"
-    echo "$((option))) 生成线路机脚本(出口为本机ss协议)"
+    printf '  %s\n' "$option) 生成线路机脚本(出口为本机ss协议)"
     option=$((option + 1))
     
     MENU_MAP[$option]="uninstall"
-    echo "$((option))) 卸载 sing-box"
+    printf '  %s\n' "$option) 卸载 sing-box"
     
-    cat <<MENU2
-0) 退出
-==========================
-MENU2
+    printf '\n  0) 退出\n\n'
 }
 
 # 主循环
 while true; do
     show_menu
-    read -p "请输入选项: " opt
+    printf '请选择操作 [0 退出]：'
+    IFS= read -r opt || exit 0
     
     # 处理退出
     if [ "$opt" = "0" ]; then
@@ -1698,4 +1702,17 @@ SB_SCRIPT
 
 chmod +x "$SB_PATH"
 ln -sf /usr/local/bin/sb /usr/bin/sb
-info "✅ 管理面板已创建,可输入 sb 打开管理面板"
+ok "管理面板已安装：$SB_PATH"
+
+printf '\n  ────────────────────────────────────\n'
+ok "Sing-box 部署完成"
+field '连接地址' "$PUB_IP"
+show_protocol_ports
+if $ENABLE_REALITY || $ENABLE_ANYTLS; then field 'Reality SNI' "$REALITY_SNI"; fi
+field '配置文件' "$CONFIG_PATH"
+field '服务文件' "$SERVICE_PATH"
+field '安装日志' "$install_log"
+field '管理命令' 'sb'
+
+printf '\n  客户端链接\n\n'
+generate_uris

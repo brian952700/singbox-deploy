@@ -30,3 +30,13 @@
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/brian952700/singbox-deploy/main/install-singbox-yyds.sh)"
 ```
+
+## 多用户管理
+
+在 VPS 上以 root 运行 `sb`，选择 **4) 用户管理**，然后选择入站。支持 Hysteria2、TUIC、VLESS Reality 和 AnyTLS Reality。可以新增用户、查看个人链接或删除用户。每个入站至少保留一个用户。Shadowsocks 沿用原有单账号配置。
+
+已有安装请运行下面的命令来更新管理面板。这个升级步骤保留现有账号和配置，服务继续运行。新增或删除用户时，面板会先校验新配置，再重启服务。
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/brian952700/singbox-deploy/main/install-singbox-yyds.sh)" -- --update-panel
+```

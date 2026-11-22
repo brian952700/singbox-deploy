@@ -632,7 +632,7 @@ user_protocol_name() {
 # 用户凭据直接保存到 sing-box 入站的 users 数组。
 user_action() (
     local rows inbound type port choice index op name pass="" uuid="" flow="" entry count host selected_name
-    local pending="" backup="" record label sni pub sid action revision link generated_name="" current_exit=""
+    local pending="" backup="" record label sni pub sid action revision link generated_name="" current_exit="" shared_exit=""
     local -a options=()
     command -v flock >/dev/null || { err "请先安装 flock 工具"; return 1; }
     revision=$(sha256sum < "$CONFIG_PATH") || return 1
@@ -672,6 +672,8 @@ user_action() (
         | (if $in.type == "tuic" then ""
            elif any($cfg.route.rules[]?; . == {inbound:[$in.tag],auth_user:[$name],action:"route",outbound:$tag})
            then " · 独立出口"
+           elif any($cfg.route.rules[]?; . == {inbound:[$in.tag],action:"route",outbound:("sb-inbound-exit:" + ($in.tag | @base64))})
+           then " · 入站共享出口"
            else " · 默认路由" end) as $status
         | "    \(.key + 1). \(if $name == "" then "未命名账号" else $name end)\($status)"
     ' "$CONFIG_PATH" || return 1
@@ -709,15 +711,24 @@ user_action() (
         2|3|4)
             if [[ "$op" == 4 && "$type" == tuic ]]; then warn "该协议不支持配置用户出口"; return 0; fi
             if (( count == 0 )); then warn "此入站没有用户"; return 0; fi
-            printf '\n请选择用户编号 [0 取消]：'
+            if [[ "$op" == 4 ]]; then
+                printf '\n请选择用户编号 [回车：当前入站全部用户，0：取消]：'
+            else
+                printf '\n请选择用户编号 [0 取消]：'
+            fi
             IFS= read -r index || return 0
             [[ "$index" == 0 ]] && return 0
-            if [[ ! "$index" =~ ^[1-9][0-9]{0,5}$ ]] || (( index > count )); then
-                warn "用户编号无效"
-                return 0
+            if [[ "$op" == 4 && -z "$index" ]]; then
+                index=-1
+                selected_name="当前入站全部用户"
+            else
+                if [[ ! "$index" =~ ^[1-9][0-9]{0,5}$ ]] || (( index > count )); then
+                    warn "用户编号无效"
+                    return 0
+                fi
+                index=$((index - 1))
+                selected_name=$(jq -r --argjson i "$inbound" --argjson j "$index" '.inbounds[$i].users[$j].name // ""' "$CONFIG_PATH") || return 1
             fi
-            index=$((index - 1))
-            selected_name=$(jq -r --argjson i "$inbound" --argjson j "$index" '.inbounds[$i].users[$j].name // ""' "$CONFIG_PATH") || return 1
             if [[ "$op" == 3 ]]; then
                 if (( count == 1 )); then warn "每个入站至少保留一个用户"; return 0; fi
                 printf '删除「%s」并重启服务？其链接将失效 [y/N]：' "${selected_name:-未命名账号 #$((index + 1))}"
@@ -728,21 +739,34 @@ user_action() (
             elif [[ "$op" == 4 ]]; then
                 record=$(jq -ce --argjson i "$inbound" --argjson j "$index" '
                     .inbounds[$i] | select(.tag | type == "string" and length > 0)
-                    | {tag, name:(.users[$j].name // "")}
+                    | {tag, name:(if $j < 0 then "" else (.users[$j].name // "") end)}
                 ' "$CONFIG_PATH") || { warn "该入站没有可用的标签"; return 1; }
                 name=$(jq -r '.name' <<< "$record") || return 1
                 current_exit=$(jq -r --argjson i "$inbound" --argjson j "$index" '
                     .inbounds[$i] as $in
                     | ($in.users[$j].name // "") as $name
-                    | ("sb-user-exit:" + ([$in.tag, $name] | @base64)) as $tag
-                    | if any(.route.rules[]?; . == {inbound:[$in.tag],auth_user:[$name],action:"route",outbound:$tag})
-                      then [.outbounds[] | select(.tag == $tag) | "\(.type) · \(.server):\(.server_port)"][0] // ""
+                    | {inbound:[$in.tag],action:"route",outbound:("sb-inbound-exit:" + ($in.tag | @base64))} as $shared
+                    | ($shared + {auth_user:[$name],outbound:("sb-user-exit:" + ([$in.tag, $name] | @base64))}) as $personal
+                    | (if $j < 0 then $shared else $personal end) as $rule
+                    | if any(.route.rules[]?; . == $rule)
+                      then [.outbounds[] | select(.tag == $rule.outbound) | "\(.type) · \(.server):\(.server_port)"][0] // ""
                       else "" end
                 ' "$CONFIG_PATH") || return 1
-                printf '\n  用户：%s\n  当前出口：%s\n\n' "${selected_name:-未命名账号}" "${current_exit:-使用默认路由}"
-                printf '  1) 导入或更换出口\n  2) 恢复默认路由\n  0) 返回\n请选择：'
+                if (( index >= 0 )) && [[ -z "$current_exit" ]]; then
+                    shared_exit=$(jq -r --argjson i "$inbound" '
+                        .inbounds[$i].tag as $in
+                        | ("sb-inbound-exit:" + ($in | @base64)) as $tag
+                        | if any(.route.rules[]?; . == {inbound:[$in],action:"route",outbound:$tag})
+                          then [.outbounds[] | select(.tag == $tag) | "\(.type) · \(.server):\(.server_port)"][0] // ""
+                          else "" end
+                    ' "$CONFIG_PATH") || return 1
+                    if [[ -n "$shared_exit" ]]; then shared_exit="入站共享出口 · $shared_exit"; fi
+                fi
+                printf '\n  用户：%s\n  当前出口：%s\n\n' "${selected_name:-未命名账号}" "${current_exit:-${shared_exit:-使用默认路由}}"
+                printf '  1) 导入或更换出口\n  2) 移除当前绑定\n  0) 返回\n请选择：'
                 IFS= read -r choice || return 0
                 action=unbind
+                if (( index < 0 )); then action=unbind_all; fi
                 entry=null
                 case "$choice" in
                     0) return 0 ;;
@@ -754,15 +778,19 @@ user_action() (
                             return 1
                         fi
                         unset link
-                        if [[ -z "$name" ]]; then
+                        if (( index >= 0 )) && [[ -z "$name" ]]; then
                             generated_name=$(rand_uuid) || return 1
                             generated_name="sb-user-$generated_name"
                         fi
                         action=bind
+                        if (( index < 0 )); then action=bind_all; fi
                         ;;
                     2) [[ -n "$current_exit" ]] || return 0 ;;
                     *) warn "无效选项"; return 0 ;;
                 esac
+                if [[ "$action" == bind_all ]]; then
+                    warn "当前入站的所有用户将共用新出口，已有个人出口绑定会被删除。"
+                fi
                 printf '应用出口配置并重启服务？[y/N]：'
                 IFS= read -r choice || return 0
                 [[ "$choice" =~ ^[Yy]$ ]] || return 0
@@ -802,6 +830,24 @@ user_action() (
                     | .outbounds[-1].domain_resolver = "sb-user-exit-dns"
                 end;
             if $op == "add" then .inbounds[$i].users += $data
+            elif $op == "bind_all" or $op == "unbind_all" then
+                .inbounds[$i].tag as $in
+                | if ($in // "") == "" or ([.inbounds[] | select(.tag == $in)] | length) != 1
+                  then error("入站标签无效或重复") else . end
+                | ("sb-inbound-exit:" + ($in | @base64)) as $tag
+                | {inbound:[$in],action:"route",outbound:$tag} as $shared
+                | remove_binding($shared)
+                | if $op == "unbind_all" then .
+                  else
+                      [.route.rules[]? | select((.auth_user | type) == "array" and (.auth_user | length) == 1)
+                          | .auth_user[0] as $name
+                          | select(. == route_for($in; $name; ("sb-user-exit:" + ([$in, $name] | @base64))))] as $personal
+                      | reduce $personal[] as $rule (. ; remove_binding($rule))
+                      | if any(.outbounds[]?; .tag == $tag) then error("出口标签已被占用") else . end
+                      | .outbounds += [$data[0] + {tag:$tag}]
+                      | .route.rules = ([$shared] + (.route.rules // []))
+                      | add_domain_resolver($data[0])
+                  end
             else
                 .inbounds[$i] as $in
                 | ($in.users[$j].name // "") as $original_name

@@ -37,6 +37,8 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/brian952700/singbox-depl
 
 打开 `sb → 4) 用户管理`，选择 Hysteria2、VLESS Reality 或 AnyTLS Reality，再选 **4) 配置用户出口**。选中用户后，可以粘贴 `vless://` 或 `ss://` 链接来绑定或更换出口，也可以恢复默认路由。同名账号位于不同入站时可以绑定不同出口。已有 VPS 可用上面的 `--update-panel` 命令更新面板。
 
+配置出口时，用户编号直接回车可选择当前入站的全部用户。确认导入后，会设置入站共享出口并清除该入站以前的个人绑定。此后仍可给个别用户重新配置独立出口，个人绑定优先于共享出口。要移除共享出口，选择全部用户后选「移除当前绑定」。
+
 - VLESS 支持 TCP、WebSocket、普通 gRPC，以及链接中的 TLS 或 REALITY 参数。XHTTP 和 Xray 专有加密参数暂不支持。
 - Shadowsocks 支持常见 `ss://` 链接和旧式 Base64 链接。带 SIP003 插件的链接暂不支持。
 - 应用配置会重启 sing-box。现有用户的入站密码、UUID 和客户端链接可继续使用。

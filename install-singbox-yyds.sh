@@ -1028,10 +1028,10 @@ show_menu() {
     
     panel_heading 'Sing-box 管理面板'
     panel_section '用户与节点'
-    printf '    %s\n' '1) 查看协议链接' '4) 用户管理'
+    printf '    %s\n' '1) 查看协议链接' '2) 用户管理'
     printf '\n'
     panel_section '配置与端口'
-    printf '    %s\n' '2) 查看配置文件路径' '3) 编辑配置文件'
+    printf '    %s\n' '3) 查看配置文件路径' '4) 编辑配置文件'
 
     # 构建协议重置选项映射
     declare -g -A MENU_MAP=()
@@ -1112,9 +1112,9 @@ while true; do
     # 处理固定选项
     case "$opt" in
         1) action_view_uri ;;
-        2) action_view_config ;;
-        3) action_edit_config ;;
-        4) user_management || warn "无法打开用户管理" ;;
+        2) user_management || warn "无法打开用户管理" ;;
+        3) action_view_config ;;
+        4) action_edit_config ;;
         *)
             # 处理动态选项
             action="${MENU_MAP[$opt]:-}"

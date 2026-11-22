@@ -25,7 +25,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/brian952700/singbox-depl
 
 ## 多用户管理
 
-在 VPS 上以 root 运行 `sb`，选择 **4) 用户管理**，然后选择入站。支持 Hysteria2、TUIC、VLESS Reality 和 AnyTLS Reality。可以新增用户、查看个人链接或删除用户。每个入站至少保留一个用户。Shadowsocks 沿用原有单账号配置。
+在 VPS 上以 root 运行 `sb`，选择 **2) 用户管理**，然后选择入站。支持 Hysteria2、TUIC、VLESS Reality 和 AnyTLS Reality。可以新增用户、查看个人链接或删除用户。每个入站至少保留一个用户。Shadowsocks 沿用原有单账号配置。
 
 已有安装请运行下面的命令来更新管理面板。这个升级步骤保留现有账号和配置，服务继续运行。新增或删除用户时，面板会先校验新配置，再重启服务。
 
@@ -35,7 +35,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/brian952700/singbox-depl
 
 ## 为用户配置出口
 
-打开 `sb → 4) 用户管理`，选择 Hysteria2、VLESS Reality 或 AnyTLS Reality。用户列表会显示每位用户当前使用默认路由、独立出口还是共享出口。
+打开 `sb → 2) 用户管理`，选择 Hysteria2、VLESS Reality 或 AnyTLS Reality。用户列表会显示每位用户当前使用默认路由、独立出口还是共享出口。
 
 - **个人出口**：选择用户编号，再选「配置独立出口」，粘贴 `vless://` 或 `ss://` 链接。可以在同一用户页查看个人链接、配置或移除绑定。
 - **共享出口**：在用户列表按 `A` 或直接回车。确认导入后，会为当前入站设置共享出口，同时清除该入站已有的个人绑定。之后可重新设置个人出口，个人出口优先。

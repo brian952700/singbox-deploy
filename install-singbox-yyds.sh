@@ -524,8 +524,8 @@ parse_user_outbound() {
     body="${uri#*://}"
     body="${body%%#*}"
     if [[ "$body" == *\?* ]]; then
-        query="${body#*?}"
-        body="${body%%?*}"
+        query="${body#*[?]}"
+        body="${body%%[?]*}"
     fi
     if [[ "$scheme" == ss && "$body" != *@* ]]; then
         body=$(decode_share_base64 "$body") || return 1
@@ -747,9 +747,8 @@ user_action() (
                 case "$choice" in
                     0) return 0 ;;
                     1)
-                        printf '粘贴 vless:// 或 ss:// 链接（输入隐藏）：'
-                        IFS= read -rs link || return 0
-                        printf '\n'
+                        printf '粘贴 vless:// 或 ss:// 链接：'
+                        IFS= read -r link || return 0
                         if ! entry=$(parse_user_outbound "$link" 2>/dev/null); then
                             warn "链接格式无效，或传输方式、加密参数暂不支持"
                             return 1

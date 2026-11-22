@@ -630,40 +630,180 @@ user_protocol_name() {
 }
 
 # 用户凭据直接保存到 sing-box 入站的 users 数组。
-user_action() (
-    local rows inbound type port choice index op name pass="" uuid="" flow="" entry count host selected_name
-    local pending="" backup="" record label sni pub sid action revision link generated_name="" current_exit="" shared_exit=""
-    local -a options=()
-    command -v flock >/dev/null || { err "请先安装 flock 工具"; return 1; }
-    revision=$(sha256sum < "$CONFIG_PATH") || return 1
-    rows=$(jq -r '
-        .inbounds | to_entries[]
-        | select(.value.users | type == "array")
-        | select(.value.type == "hysteria2" or .value.type == "tuic"
-            or ((.value.type == "vless" or .value.type == "anytls")
-                and .value.tls.reality.enabled == true))
-        | [.key, .value.type, .value.listen_port, (.value.users | length)] | @tsv
-    ' "$CONFIG_PATH") || return 1
-    [[ -n "$rows" ]] || { warn "暂无支持用户管理的入站"; return 0; }
+panel_heading() {
+    printf '\n  ────────────────────────────────────\n'
+    status_line 34 "  $1"
+    printf '  ────────────────────────────────────\n\n'
+}
 
-    printf '\n  ────────────────────────────────────\n'
-    status_line 34 '用户管理' '选择入站协议'
-    printf '\n'
-    while IFS=$'\t' read -r inbound type port count; do
-        options+=("$inbound $type $port $count")
-        printf '  %s) %s · 端口 %s · %s 位用户\n' "${#options[@]}" "$(user_protocol_name "$type")" "$port" "$count"
-    done <<< "$rows"
-    printf '\n  0) 返回主菜单\n\n请选择入站：'
-    IFS= read -r choice || return 0
-    [[ "$choice" == 0 ]] && return 0
-    if [[ ! "$choice" =~ ^[1-9][0-9]{0,5}$ ]] || (( choice > ${#options[@]} )); then
-        warn "无效选项"
-        return 0
-    fi
-    read -r inbound type port count <<< "${options[choice - 1]}"
-    printf '\n  ────────────────────────────────────\n'
-    status_line 34 "$(user_protocol_name "$type")" "端口 $port · $count 位用户"
-    printf '\n  用户列表\n'
+panel_section() {
+    status_line 34 "  $1"
+}
+
+panel_pause() {
+    local reply
+    printf '\n按回车返回…'
+    IFS= read -r reply || return 0
+}
+
+managed_exit_summary() {
+    local inbound="$1" index="$2"
+    jq -c --argjson i "$inbound" --argjson j "$index" '
+        def describe($rule):
+            if any(.route.rules[]?; . == $rule)
+            then [.outbounds[] | select(.tag == $rule.outbound)
+                  | "\(.type) · \(.server):\(.server_port)"][0] // ""
+            else "" end;
+        .inbounds[$i] as $in
+        | ($in.users[$j].name // "") as $name
+        | {inbound:[$in.tag],action:"route",outbound:("sb-inbound-exit:" + ($in.tag | @base64))} as $shared
+        | ($shared + {auth_user:[$name],outbound:("sb-user-exit:" + ([$in.tag, $name] | @base64))}) as $personal
+        | {shared:describe($shared), personal:(if $j < 0 then "" else describe($personal) end)}
+    ' "$CONFIG_PATH"
+}
+
+user_detail_menu() {
+    local inbound="$1" type="$2" port="$3" index="$4" title="$5"
+    local name summary personal shared choice action result
+    while true; do
+        name=$(jq -er --argjson i "$inbound" --argjson j "$index" '
+            .inbounds[$i].users[$j] | select(. != null) | .name // "未命名账号"
+        ' "$CONFIG_PATH") || return 1
+        panel_heading "$title / $name"
+        printf '  端口          %s\n' "$port"
+        if [[ "$type" != tuic ]]; then
+            summary=$(managed_exit_summary "$inbound" "$index") || return 1
+            personal=$(jq -r '.personal' <<< "$summary") || return 1
+            shared=$(jq -r '.shared' <<< "$summary") || return 1
+            if [[ -n "$personal" ]]; then
+                printf '  当前出口      %s（独立）\n' "$personal"
+            elif [[ -n "$shared" ]]; then
+                printf '  当前出口      %s（入站共享）\n' "$shared"
+            else
+                printf '  当前出口      默认路由\n'
+            fi
+        fi
+
+        printf '\n    1) 查看个人链接\n'
+        if [[ "$type" != tuic ]]; then
+            printf '    2) 配置独立出口\n'
+            if [[ -n "$personal" ]]; then printf '    3) 移除个人出口绑定\n'; fi
+        fi
+        status_line 31 '    D)' '删除用户'
+        printf '\n    0) 返回用户列表\n\n请选择操作：'
+        IFS= read -r choice || return 0
+
+        case "$choice" in
+            0) return 0 ;;
+            1) action=view ;;
+            2) if [[ "$type" == tuic ]]; then warn "无效选项"; continue; fi; action=bind ;;
+            3) if [[ "$type" == tuic || -z "$personal" ]]; then warn "无效选项"; continue; fi; action=unbind ;;
+            d|D) action=delete ;;
+            *) warn "无效选项"; continue ;;
+        esac
+        result=0
+        user_action "$inbound" "$type" "$port" "$index" "$action" || result=$?
+        if (( result == 10 )); then panel_pause; return 0; fi
+        if (( result != 0 )); then warn "用户操作未完成"; fi
+        panel_pause
+    done
+}
+
+shared_exit_menu() {
+    local inbound="$1" type="$2" port="$3" title="$4" summary current choice action
+    while true; do
+        summary=$(managed_exit_summary "$inbound" -1) || return 1
+        current=$(jq -r '.shared' <<< "$summary") || return 1
+        panel_heading "$title / 共享出口"
+        printf '  当前共享出口  %s\n' "${current:-未设置}"
+        printf '\n    1) 导入或更换共享出口\n'
+        if [[ -n "$current" ]]; then printf '    2) 移除共享出口\n'; fi
+        printf '\n    0) 返回用户列表\n\n请选择操作：'
+        IFS= read -r choice || return 0
+        case "$choice" in
+            0) return 0 ;;
+            1) action=bind_all ;;
+            2) if [[ -z "$current" ]]; then warn "无效选项"; continue; fi; action=unbind_all ;;
+            *) warn "无效选项"; continue ;;
+        esac
+        user_action "$inbound" "$type" "$port" -1 "$action" || warn "出口操作未完成"
+        panel_pause
+    done
+}
+
+inbound_user_menu() {
+    local inbound="$1" type="$2" port="$3" count choice title
+    title="用户管理 / $(user_protocol_name "$type")"
+    while true; do
+        count=$(jq -er --argjson i "$inbound" '.inbounds[$i].users | length' "$CONFIG_PATH") || return 1
+        panel_heading "$title"
+        printf '  端口 %s · %s 位用户\n\n' "$port" "$count"
+        panel_section '用户列表'
+        list_inbound_users "$inbound" || return 1
+        if (( count == 0 )); then printf '    暂无用户\n'; fi
+
+        printf '\n'
+        panel_section '入站操作'
+        printf '    N) 新增用户\n'
+        if [[ "$type" != tuic ]]; then printf '    A) 配置当前入站共享出口（回车快捷键）\n'; fi
+        printf '\n    0) 返回协议列表\n\n请选择用户编号或操作：'
+        IFS= read -r choice || return 0
+        case "$choice" in
+            0) return 0 ;;
+            n|N)
+                user_action "$inbound" "$type" "$port" "$count" add || warn "新增用户未完成"
+                panel_pause
+                ;;
+            a|A|"")
+                if [[ "$type" == tuic ]]; then warn "无效选项"; continue; fi
+                shared_exit_menu "$inbound" "$type" "$port" "$title" || warn "无法打开共享出口"
+                ;;
+            *)
+                if [[ "$choice" =~ ^[1-9][0-9]{0,5}$ ]] && (( choice <= count )); then
+                    user_detail_menu "$inbound" "$type" "$port" "$((choice - 1))" "$title" || warn "无法打开用户"
+                else
+                    warn "用户编号无效"
+                fi
+                ;;
+        esac
+    done
+}
+
+user_management() {
+    local rows inbound type port count choice
+    local -a options
+    command -v flock >/dev/null || { err "请先安装 flock 工具"; return 1; }
+    while true; do
+        rows=$(jq -r '
+            .inbounds | to_entries[]
+            | select(.value.users | type == "array")
+            | select(.value.type == "hysteria2" or .value.type == "tuic"
+                or ((.value.type == "vless" or .value.type == "anytls")
+                    and .value.tls.reality.enabled == true))
+            | [.key, .value.type, .value.listen_port, (.value.users | length)] | @tsv
+        ' "$CONFIG_PATH") || return 1
+        [[ -n "$rows" ]] || { warn "暂无支持用户管理的入站"; return 0; }
+
+        panel_heading '用户管理 / 选择入站协议'
+        options=()
+        while IFS=$'\t' read -r inbound type port count; do
+            options+=("$inbound $type $port")
+            printf '    %s) %s · 端口 %s · %s 位用户\n' "${#options[@]}" "$(user_protocol_name "$type")" "$port" "$count"
+        done <<< "$rows"
+        printf '\n    0) 返回主菜单\n\n请选择入站：'
+        IFS= read -r choice || return 0
+        [[ "$choice" == 0 ]] && return 0
+        if [[ ! "$choice" =~ ^[1-9][0-9]{0,5}$ ]] || (( choice > ${#options[@]} )); then
+            warn "无效选项"
+            continue
+        fi
+        read -r inbound type port <<< "${options[choice - 1]}"
+        inbound_user_menu "$inbound" "$type" "$port" || warn "无法打开入站用户列表"
+    done
+}
+
+list_inbound_users() {
+    local inbound="$1"
     jq -r --argjson i "$inbound" '
         . as $cfg | .inbounds[$i] as $in
         | $in.users | to_entries[]
@@ -676,15 +816,16 @@ user_action() (
            then " · 入站共享出口"
            else " · 默认路由" end) as $status
         | "    \(.key + 1). \(if $name == "" then "未命名账号" else $name end)\($status)"
-    ' "$CONFIG_PATH" || return 1
-    if (( count == 0 )); then printf '    暂无用户\n'; fi
-    printf '\n  操作\n    1) 新增用户\n    2) 查看用户链接\n    3) 删除用户\n'
-    if [[ "$type" != tuic ]]; then printf '    4) 配置用户出口\n'; fi
-    printf '    0) 返回主菜单\n\n请选择操作：'
-    IFS= read -r op || return 0
-    case "$op" in
-        0) return 0 ;;
-        1)
+    ' "$CONFIG_PATH"
+}
+
+user_action() (
+    local inbound="$1" type="$2" port="$3" index="$4" action="$5"
+    local choice name pass="" uuid="" flow="" entry=null host count
+    local pending="" backup="" record label sni pub sid revision link generated_name=""
+    revision=$(sha256sum < "$CONFIG_PATH") || return 1
+    case "$action" in
+        add)
             printf '用户名（1–32 位英文字母、数字、点、下划线或连字符）：'
             IFS= read -r name || return 0
             [[ "$name" =~ ^[A-Za-z0-9._-]{1,32}$ ]] || { warn "用户名格式无效"; return 0; }
@@ -705,101 +846,58 @@ user_action() (
                 [inputs] | {name:$n, password:.[0], uuid:.[1], flow:$f}
                 | with_entries(select(.value != ""))
             ') || return 1
-            index="$count"
-            action=add
+            status_line 33 '确认' "添加 $name 会重启 sing-box。"
+            printf '\n继续添加？[y/N]：'
+            IFS= read -r choice || return 0
+            [[ "$choice" =~ ^[Yy]$ ]] || return 0
             ;;
-        2|3|4)
-            if [[ "$op" == 4 && "$type" == tuic ]]; then warn "该协议不支持配置用户出口"; return 0; fi
-            if (( count == 0 )); then warn "此入站没有用户"; return 0; fi
-            if [[ "$op" == 4 ]]; then
-                printf '\n请选择用户编号 [回车：当前入站全部用户，0：取消]：'
-            else
-                printf '\n请选择用户编号 [0 取消]：'
+        delete)
+            count=$(jq -er --argjson i "$inbound" '.inbounds[$i].users | length' "$CONFIG_PATH") || return 1
+            if (( count <= 1 )); then warn "每个入站至少保留一个用户"; return 0; fi
+            name=$(jq -er --argjson i "$inbound" --argjson j "$index" '
+                .inbounds[$i].users[$j] | select(. != null) | .name // "未命名账号"
+            ' "$CONFIG_PATH") || return 1
+            status_line 31 '删除用户' "「$name」的链接将失效，服务将重启。"
+            printf '\n确认删除？[y/N]：'
+            IFS= read -r choice || return 0
+            [[ "$choice" =~ ^[Yy]$ ]] || return 0
+            ;;
+        bind|bind_all)
+            printf '\n粘贴 vless:// 或 ss:// 链接（留空取消）：'
+            IFS= read -r link || return 0
+            [[ -n "$link" ]] || return 0
+            if ! entry=$(parse_user_outbound "$link" 2>/dev/null); then
+                warn "链接格式无效，或传输方式、加密参数暂不支持"
+                return 1
             fi
-            IFS= read -r index || return 0
-            [[ "$index" == 0 ]] && return 0
-            if [[ "$op" == 4 && -z "$index" ]]; then
-                index=-1
-                selected_name="当前入站全部用户"
-            else
-                if [[ ! "$index" =~ ^[1-9][0-9]{0,5}$ ]] || (( index > count )); then
-                    warn "用户编号无效"
-                    return 0
-                fi
-                index=$((index - 1))
-                selected_name=$(jq -r --argjson i "$inbound" --argjson j "$index" '.inbounds[$i].users[$j].name // ""' "$CONFIG_PATH") || return 1
-            fi
-            if [[ "$op" == 3 ]]; then
-                if (( count == 1 )); then warn "每个入站至少保留一个用户"; return 0; fi
-                printf '删除「%s」并重启服务？其链接将失效 [y/N]：' "${selected_name:-未命名账号 #$((index + 1))}"
-                IFS= read -r choice || return 0
-                [[ "$choice" =~ ^[Yy]$ ]] || return 0
-                action=delete
-                entry=null
-            elif [[ "$op" == 4 ]]; then
-                record=$(jq -ce --argjson i "$inbound" --argjson j "$index" '
-                    .inbounds[$i] | select(.tag | type == "string" and length > 0)
-                    | {tag, name:(if $j < 0 then "" else (.users[$j].name // "") end)}
-                ' "$CONFIG_PATH") || { warn "该入站没有可用的标签"; return 1; }
-                name=$(jq -r '.name' <<< "$record") || return 1
-                current_exit=$(jq -r --argjson i "$inbound" --argjson j "$index" '
-                    .inbounds[$i] as $in
-                    | ($in.users[$j].name // "") as $name
-                    | {inbound:[$in.tag],action:"route",outbound:("sb-inbound-exit:" + ($in.tag | @base64))} as $shared
-                    | ($shared + {auth_user:[$name],outbound:("sb-user-exit:" + ([$in.tag, $name] | @base64))}) as $personal
-                    | (if $j < 0 then $shared else $personal end) as $rule
-                    | if any(.route.rules[]?; . == $rule)
-                      then [.outbounds[] | select(.tag == $rule.outbound) | "\(.type) · \(.server):\(.server_port)"][0] // ""
-                      else "" end
+            unset link
+            if [[ "$action" == bind ]]; then
+                name=$(jq -er --argjson i "$inbound" --argjson j "$index" '
+                    .inbounds[$i].users[$j] | select(. != null) | .name // ""
                 ' "$CONFIG_PATH") || return 1
-                if (( index >= 0 )) && [[ -z "$current_exit" ]]; then
-                    shared_exit=$(jq -r --argjson i "$inbound" '
-                        .inbounds[$i].tag as $in
-                        | ("sb-inbound-exit:" + ($in | @base64)) as $tag
-                        | if any(.route.rules[]?; . == {inbound:[$in],action:"route",outbound:$tag})
-                          then [.outbounds[] | select(.tag == $tag) | "\(.type) · \(.server):\(.server_port)"][0] // ""
-                          else "" end
-                    ' "$CONFIG_PATH") || return 1
-                    if [[ -n "$shared_exit" ]]; then shared_exit="入站共享出口 · $shared_exit"; fi
+                if [[ -z "$name" ]]; then
+                    generated_name=$(rand_uuid) || return 1
+                    generated_name="sb-user-$generated_name"
                 fi
-                printf '\n  用户：%s\n  当前出口：%s\n\n' "${selected_name:-未命名账号}" "${current_exit:-${shared_exit:-使用默认路由}}"
-                printf '  1) 导入或更换出口\n  2) 移除当前绑定\n  0) 返回\n请选择：'
-                IFS= read -r choice || return 0
-                action=unbind
-                if (( index < 0 )); then action=unbind_all; fi
-                entry=null
-                case "$choice" in
-                    0) return 0 ;;
-                    1)
-                        printf '粘贴 vless:// 或 ss:// 链接：'
-                        IFS= read -r link || return 0
-                        if ! entry=$(parse_user_outbound "$link" 2>/dev/null); then
-                            warn "链接格式无效，或传输方式、加密参数暂不支持"
-                            return 1
-                        fi
-                        unset link
-                        if (( index >= 0 )) && [[ -z "$name" ]]; then
-                            generated_name=$(rand_uuid) || return 1
-                            generated_name="sb-user-$generated_name"
-                        fi
-                        action=bind
-                        if (( index < 0 )); then action=bind_all; fi
-                        ;;
-                    2) [[ -n "$current_exit" ]] || return 0 ;;
-                    *) warn "无效选项"; return 0 ;;
-                esac
-                if [[ "$action" == bind_all ]]; then
-                    warn "当前入站的所有用户将共用新出口，已有个人出口绑定会被删除。"
-                fi
-                printf '应用出口配置并重启服务？[y/N]：'
-                IFS= read -r choice || return 0
-                [[ "$choice" =~ ^[Yy]$ ]] || return 0
+            else
+                warn "当前入站的所有用户将共用新出口，已有个人出口绑定会被删除。"
             fi
+            status_line 33 '确认' '应用出口需要重启 sing-box。'
+            printf '\n确认应用？[y/N]：'
+            IFS= read -r choice || return 0
+            [[ "$choice" =~ ^[Yy]$ ]] || return 0
             ;;
-        *) warn "无效选项"; return 0 ;;
+        unbind|unbind_all)
+            status_line 33 '确认' '移除当前出口绑定会重启 sing-box。'
+            printf '\n确认移除？[y/N]：'
+            IFS= read -r choice || return 0
+            [[ "$choice" =~ ^[Yy]$ ]] || return 0
+            ;;
+        view) ;;
+        *) return 1 ;;
     esac
 
-    if [[ "$op" != 2 ]]; then
+    if [[ "$action" != view ]]; then
         pending=$(mktemp "${CONFIG_PATH%/*}/.users-new.XXXXXXXX.json") || return 1
         trap 'rm -f -- "$pending" "$backup"' EXIT
         backup=$(mktemp "${CONFIG_PATH%/*}/.users-old.XXXXXXXX.json") || return 1
@@ -885,9 +983,11 @@ user_action() (
             service_restart || err "原配置已恢复，请检查服务状态"
             return 1
         fi
-        if [[ "$op" == 3 ]]; then info "用户已删除"; return 0; fi
-        if [[ "$op" == 4 ]]; then info "用户出口已更新"; return 0; fi
-        info "已新增用户 $name"
+        case "$action" in
+            delete) status_line 32 '[成功]' "已删除用户 $name"; return 10 ;;
+            add) status_line 32 '[成功]' "已新增用户 $name" ;;
+            *) status_line 32 '[成功]' "用户出口已更新"; return 0 ;;
+        esac
     fi
 
     read_config || return 1
@@ -926,70 +1026,75 @@ user_action() (
 show_menu() {
     read_config 2>/dev/null || true
     
-    printf '\n  ────────────────────────────────────\n'
-    status_line 34 'Sing-box' '管理面板'
-    printf '  ────────────────────────────────────\n\n'
-    printf '  %s\n' '1) 查看协议链接' '2) 查看配置文件路径' '3) 编辑配置文件' '4) 用户管理'
+    panel_heading 'Sing-box 管理面板'
+    panel_section '用户与节点'
+    printf '    %s\n' '1) 查看协议链接' '4) 用户管理'
+    printf '\n'
+    panel_section '配置与端口'
+    printf '    %s\n' '2) 查看配置文件路径' '3) 编辑配置文件'
 
     # 构建协议重置选项映射
-    declare -g -A MENU_MAP
+    declare -g -A MENU_MAP=()
     local option=5
     
     if [ "${ENABLE_SS:-false}" = "true" ]; then
-        printf '  %s\n' "$option) 重置 SS 端口"
+        printf '    %s\n' "$option) 重置 SS 端口"
         MENU_MAP[$option]="reset_ss"
         option=$((option + 1))
     fi
     
     if [ "${ENABLE_HY2:-false}" = "true" ]; then
-        printf '  %s\n' "$option) 重置 HY2 端口"
+        printf '    %s\n' "$option) 重置 HY2 端口"
         MENU_MAP[$option]="reset_hy2"
         option=$((option + 1))
     fi
     
     if [ "${ENABLE_TUIC:-false}" = "true" ]; then
-        printf '  %s\n' "$option) 重置 TUIC 端口"
+        printf '    %s\n' "$option) 重置 TUIC 端口"
         MENU_MAP[$option]="reset_tuic"
         option=$((option + 1))
     fi
     
     if [ "${ENABLE_REALITY:-false}" = "true" ]; then
-        printf '  %s\n' "$option) 重置 Vless Reality 端口"
+        printf '    %s\n' "$option) 重置 Vless Reality 端口"
         MENU_MAP[$option]="reset_reality"
         option=$((option + 1))
     fi
     
     if [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
-        printf '  %s\n' "$option) 重置 AnyTLS Reality 端口"
+        printf '    %s\n' "$option) 重置 AnyTLS Reality 端口"
         MENU_MAP[$option]="reset_anytls"
         option=$((option + 1))
     fi
 
-    # 固定功能选项
+    printf '\n'
+    panel_section '服务管理'
     MENU_MAP[$option]="start"
-    printf '  %s\n' "$option) 启动服务"
+    printf '    %s\n' "$option) 启动服务"
     option=$((option + 1))
     
     MENU_MAP[$option]="stop"
-    printf '  %s\n' "$option) 停止服务"
+    printf '    %s\n' "$option) 停止服务"
     option=$((option + 1))
     
     MENU_MAP[$option]="restart"
-    printf '  %s\n' "$option) 重启服务"
+    printf '    %s\n' "$option) 重启服务"
     option=$((option + 1))
     
     MENU_MAP[$option]="status"
-    printf '  %s\n' "$option) 查看状态"
+    printf '    %s\n' "$option) 查看状态"
     option=$((option + 1))
     
+    printf '\n'
+    panel_section '维护'
     MENU_MAP[$option]="update"
-    printf '  %s\n' "$option) 更新 sing-box"
+    printf '    %s\n' "$option) 更新 sing-box"
     option=$((option + 1))
     
     MENU_MAP[$option]="uninstall"
-    printf '  %s\n' "$option) 卸载 sing-box"
+    status_line 31 "    $option)" "卸载 sing-box"
     
-    printf '\n  0) 退出\n\n'
+    printf '\n    0) 退出\n\n'
 }
 
 # 主循环
@@ -1009,7 +1114,7 @@ while true; do
         1) action_view_uri ;;
         2) action_view_config ;;
         3) action_edit_config ;;
-        4) user_action || warn "用户操作未完成" ;;
+        4) user_management || warn "无法打开用户管理" ;;
         *)
             # 处理动态选项
             action="${MENU_MAP[$opt]:-}"
@@ -1019,9 +1124,9 @@ while true; do
                 reset_tuic) action_reset_tuic ;;
                 reset_reality) action_reset_reality ;;
                 reset_anytls) action_reset_anytls ;;
-                start) service_start && info "已启动" ;;
-                stop) service_stop && info "已停止" ;;
-                restart) service_restart && info "已重启" ;;
+                start) service_start && status_line 32 "[成功]" "已启动" ;;
+                stop) service_stop && status_line 32 "[成功]" "已停止" ;;
+                restart) service_restart && status_line 32 "[成功]" "已重启" ;;
                 status) service_status ;;
                 update) action_update ;;
                 uninstall) action_uninstall; exit 0 ;;

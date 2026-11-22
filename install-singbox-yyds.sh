@@ -620,9 +620,18 @@ parse_user_outbound() {
     '
 }
 
+user_protocol_name() {
+    case "$1" in
+        hysteria2) printf '%s' 'Hysteria2' ;;
+        tuic) printf '%s' 'TUIC' ;;
+        vless) printf '%s' 'VLESS + REALITY' ;;
+        anytls) printf '%s' 'AnyTLS + REALITY' ;;
+    esac
+}
+
 # 用户凭据直接保存到 sing-box 入站的 users 数组。
 user_action() (
-    local rows inbound type port choice index op name pass="" uuid="" flow="" entry count host
+    local rows inbound type port choice index op name pass="" uuid="" flow="" entry count host selected_name
     local pending="" backup="" record label sni pub sid action revision link generated_name="" current_exit=""
     local -a options=()
     command -v flock >/dev/null || { err "请先安装 flock 工具"; return 1; }
@@ -633,32 +642,43 @@ user_action() (
         | select(.value.type == "hysteria2" or .value.type == "tuic"
             or ((.value.type == "vless" or .value.type == "anytls")
                 and .value.tls.reality.enabled == true))
-        | [.key, .value.type, .value.listen_port] | @tsv
+        | [.key, .value.type, .value.listen_port, (.value.users | length)] | @tsv
     ' "$CONFIG_PATH") || return 1
     [[ -n "$rows" ]] || { warn "暂无支持用户管理的入站"; return 0; }
 
-    printf '\n  用户管理 · 选择入站\n'
-    while IFS=$'\t' read -r inbound type port; do
-        options+=("$inbound $type $port")
-        printf '  %s) %s · 端口 %s\n' "${#options[@]}" "$type" "$port"
+    printf '\n  ────────────────────────────────────\n'
+    status_line 34 '用户管理' '选择入站协议'
+    printf '\n'
+    while IFS=$'\t' read -r inbound type port count; do
+        options+=("$inbound $type $port $count")
+        printf '  %s) %s · 端口 %s · %s 位用户\n' "${#options[@]}" "$(user_protocol_name "$type")" "$port" "$count"
     done <<< "$rows"
-    printf '请选择 [0 返回]：'
+    printf '\n  0) 返回主菜单\n\n请选择入站：'
     IFS= read -r choice || return 0
     [[ "$choice" == 0 ]] && return 0
     if [[ ! "$choice" =~ ^[1-9][0-9]{0,5}$ ]] || (( choice > ${#options[@]} )); then
         warn "无效选项"
         return 0
     fi
-    read -r inbound type port <<< "${options[choice - 1]}"
-    printf '\n  %s 用户\n' "$type"
+    read -r inbound type port count <<< "${options[choice - 1]}"
+    printf '\n  ────────────────────────────────────\n'
+    status_line 34 "$(user_protocol_name "$type")" "端口 $port · $count 位用户"
+    printf '\n  用户列表\n'
     jq -r --argjson i "$inbound" '
-        .inbounds[$i].users | to_entries[]
-        | "  \(.key + 1)) \(.value.name // "现有账号（未命名）")"
+        . as $cfg | .inbounds[$i] as $in
+        | $in.users | to_entries[]
+        | (.value.name // "") as $name
+        | ("sb-user-exit:" + ([$in.tag, $name] | @base64)) as $tag
+        | (if $in.type == "tuic" then ""
+           elif any($cfg.route.rules[]?; . == {inbound:[$in.tag],auth_user:[$name],action:"route",outbound:$tag})
+           then " · 独立出口"
+           else " · 默认路由" end) as $status
+        | "    \(.key + 1). \(if $name == "" then "未命名账号" else $name end)\($status)"
     ' "$CONFIG_PATH" || return 1
-    count=$(jq -er --argjson i "$inbound" '.inbounds[$i].users | length' "$CONFIG_PATH") || return 1
-    printf '\n  1) 新增用户\n  2) 查看用户链接\n  3) 删除用户\n'
-    if [[ "$type" != tuic ]]; then printf '  4) 配置用户出口\n'; fi
-    printf '  0) 返回\n请选择操作：'
+    if (( count == 0 )); then printf '    暂无用户\n'; fi
+    printf '\n  操作\n    1) 新增用户\n    2) 查看用户链接\n    3) 删除用户\n'
+    if [[ "$type" != tuic ]]; then printf '    4) 配置用户出口\n'; fi
+    printf '    0) 返回主菜单\n\n请选择操作：'
     IFS= read -r op || return 0
     case "$op" in
         0) return 0 ;;
@@ -689,16 +709,18 @@ user_action() (
         2|3|4)
             if [[ "$op" == 4 && "$type" == tuic ]]; then warn "该协议不支持配置用户出口"; return 0; fi
             if (( count == 0 )); then warn "此入站没有用户"; return 0; fi
-            printf '请输入用户编号：'
+            printf '\n请选择用户编号 [0 取消]：'
             IFS= read -r index || return 0
+            [[ "$index" == 0 ]] && return 0
             if [[ ! "$index" =~ ^[1-9][0-9]{0,5}$ ]] || (( index > count )); then
                 warn "用户编号无效"
                 return 0
             fi
             index=$((index - 1))
+            selected_name=$(jq -r --argjson i "$inbound" --argjson j "$index" '.inbounds[$i].users[$j].name // ""' "$CONFIG_PATH") || return 1
             if [[ "$op" == 3 ]]; then
                 if (( count == 1 )); then warn "每个入站至少保留一个用户"; return 0; fi
-                printf '删除用户 %s 并重启服务？其链接将失效 [y/N]：' "$((index + 1))"
+                printf '删除「%s」并重启服务？其链接将失效 [y/N]：' "${selected_name:-未命名账号 #$((index + 1))}"
                 IFS= read -r choice || return 0
                 [[ "$choice" =~ ^[Yy]$ ]] || return 0
                 action=delete
@@ -717,7 +739,7 @@ user_action() (
                       then [.outbounds[] | select(.tag == $tag) | "\(.type) · \(.server):\(.server_port)"][0] // ""
                       else "" end
                 ' "$CONFIG_PATH") || return 1
-                printf '\n当前出口：%s\n' "${current_exit:-使用默认路由}"
+                printf '\n  用户：%s\n  当前出口：%s\n\n' "${selected_name:-未命名账号}" "${current_exit:-使用默认路由}"
                 printf '  1) 导入或更换出口\n  2) 恢复默认路由\n  0) 返回\n请选择：'
                 IFS= read -r choice || return 0
                 action=unbind
@@ -1330,7 +1352,7 @@ if $ENABLE_TUIC; then
 fi
 if $ENABLE_REALITY; then UUID=$(rand_uuid); fi
 if $ENABLE_ANYTLS; then
-    ANYTLS_USER=$(openssl rand -hex 4)
+    ANYTLS_USER=admin
     ANYTLS_PSK=$(openssl rand -base64 16)
 fi
 
@@ -1445,6 +1467,7 @@ INBOUND_SS
       "listen_port": PORT_HY2_PLACEHOLDER,
       "users": [
         {
+          "name": "admin",
           "password": "PSK_HY2_PLACEHOLDER"
         }
       ],
@@ -1471,6 +1494,7 @@ INBOUND_HY2
       "listen_port": PORT_TUIC_PLACEHOLDER,
       "users": [
         {
+          "name": "admin",
           "uuid": "UUID_TUIC_PLACEHOLDER",
           "password": "PSK_TUIC_PLACEHOLDER"
         }
@@ -1500,6 +1524,7 @@ INBOUND_TUIC
       "listen_port": PORT_REALITY_PLACEHOLDER,
       "users": [
         {
+          "name": "admin",
           "uuid": "UUID_REALITY_PLACEHOLDER",
           "flow": "xtls-rprx-vision"
         }

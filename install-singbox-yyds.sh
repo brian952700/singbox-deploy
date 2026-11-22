@@ -491,10 +491,139 @@ action_uninstall() {
     info "卸载完成"
 }
 
+# 解析分享链接；通过标准输入传递凭据，避免写入命令行参数。
+decode_share_component() {
+    local input="$1" output="" hex
+    while [[ "$input" == *%* ]]; do
+        output+="${input%%%*}"
+        input="${input#*%}"
+        hex="${input:0:2}"
+        [[ "$hex" =~ ^[[:xdigit:]]{2}$ && "$hex" != 00 ]] || return 1
+        printf -v hex '%b' "\\x$hex"
+        output+="$hex"
+        input="${input:2}"
+    done
+    printf '%s' "$output$input"
+}
+
+decode_share_base64() {
+    local value="$1"
+    [[ "$value" =~ ^[A-Za-z0-9_+/-]+=*$ ]] || return 1
+    value="${value//-/+}"
+    value="${value//_//}"
+    while (( ${#value} % 4 )); do value+='='; done
+    printf '%s' "$value" | base64 -d 2>/dev/null
+}
+
+parse_user_outbound() {
+    local uri="$1" scheme body address auth server port query="" pair key value
+    local method password transport security flow legacy=false tls='null' transport_json='null'
+    local -A params=()
+    scheme="${uri%%://*}"
+    [[ "$scheme" == vless || "$scheme" == ss ]] || return 1
+    body="${uri#*://}"
+    body="${body%%#*}"
+    if [[ "$body" == *\?* ]]; then
+        query="${body#*?}"
+        body="${body%%?*}"
+    fi
+    if [[ "$scheme" == ss && "$body" != *@* ]]; then
+        body=$(decode_share_base64 "$body") || return 1
+        legacy=true
+    fi
+    [[ "$body" == *@* ]] || return 1
+    auth="${body%@*}"
+    address="${body##*@}"
+    address="${address%/}"
+    local address_pattern='^(\[([0-9A-Fa-f:.]+)\]|([A-Za-z0-9._-]+)):([0-9]{1,5})$'
+    [[ "$address" =~ $address_pattern ]] || return 1
+    server="${BASH_REMATCH[2]:-${BASH_REMATCH[3]}}"
+    port=$((10#${BASH_REMATCH[4]}))
+    (( port > 0 && port <= 65535 )) || return 1
+
+    if [[ "$scheme" == ss ]]; then
+        [[ -z "$query" ]] || return 1
+        if ! $legacy; then auth=$(decode_share_component "$auth") || return 1; fi
+        if [[ "$auth" != *:* ]]; then auth=$(decode_share_base64 "$auth") || return 1; fi
+        [[ "$auth" == *:* ]] || return 1
+        method="${auth%%:*}"
+        password="${auth#*:}"
+        [[ -n "$method" && -n "$password" ]] || return 1
+        printf '%s' "$password" | jq -Rs --arg server "$server" --argjson port "$port" --arg method "$method" \
+            '{type:"shadowsocks",server:$server,server_port:$port,method:$method,password:.}'
+        return $?
+    fi
+
+    [[ "$auth" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || return 1
+    local -a pairs=()
+    IFS='&' read -r -a pairs <<< "$query"
+    for pair in "${pairs[@]}"; do
+        [[ "$pair" == *=* ]] || return 1
+        key="${pair%%=*}"
+        case "$key" in
+            type|security|flow|encryption|sni|fp|pbk|sid|alpn|host|path|serviceName|mode|headerType) ;;
+            *) return 1 ;;
+        esac
+        [[ ! -v 'params[$key]' ]] || return 1
+        value=$(decode_share_component "${pair#*=}") || return 1
+        params[$key]="$value"
+    done
+    [[ "${params[encryption]:-none}" == none && "${params[headerType]:-none}" == none ]] || return 1
+    transport="${params[type]:-tcp}"
+    security="${params[security]:-none}"
+    flow="${params[flow]:-}"
+    [[ -z "$flow" || "$flow" == xtls-rprx-vision && ( "$transport" == tcp || "$transport" == raw ) && "$security" != none ]] || return 1
+    case "$transport" in
+        tcp|raw)
+            [[ -z "${params[host]:-}${params[path]:-}${params[serviceName]:-}${params[mode]:-}" ]] || return 1
+            ;;
+        ws)
+            [[ -z "${params[serviceName]:-}${params[mode]:-}" ]] || return 1
+            transport_json=$(jq -cn --arg path "${params[path]:-/}" --arg host "${params[host]:-}" '
+                {type:"ws", path:$path} + (if $host == "" then {} else {headers:{Host:$host}} end)
+            ') || return 1
+            ;;
+        grpc)
+            [[ "${params[mode]:-gun}" == gun && -z "${params[host]:-}${params[path]:-}" ]] || return 1
+            transport_json=$(jq -cn --arg service "${params[serviceName]:-}" '{type:"grpc",service_name:$service}') || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    case "$security" in
+        none)
+            [[ -z "${params[sni]:-}${params[fp]:-}${params[pbk]:-}${params[sid]:-}${params[alpn]:-}" ]] || return 1
+            ;;
+        tls|reality)
+            if [[ "$security" == reality ]]; then
+                [[ -n "${params[pbk]:-}" && -n "${params[sni]:-}" ]] || return 1
+            else
+                [[ -z "${params[pbk]:-}${params[sid]:-}" ]] || return 1
+            fi
+            tls=$(jq -cn --arg security "$security" --arg sni "${params[sni]:-$server}" \
+                --arg fp "${params[fp]:-}" --arg alpn "${params[alpn]:-}" \
+                --arg pbk "${params[pbk]:-}" --arg sid "${params[sid]:-}" '
+                {enabled:true,server_name:$sni}
+                + (if $alpn == "" then {} else {alpn:($alpn|split(","))} end)
+                + (if $security == "reality" or $fp != "" then
+                    {utls:{enabled:true,fingerprint:(if $fp == "" then "chrome" else $fp end)}}
+                   else {} end)
+                + (if $security == "reality" then {reality:{enabled:true,public_key:$pbk,short_id:$sid}}
+                   else {} end)
+            ') || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    printf '%s' "$auth" | jq -cRs --arg server "$server" --argjson port "$port" --arg flow "$flow" \
+        --argjson tls "$tls" --argjson transport "$transport_json" '
+        {type:"vless", server:$server, server_port:$port, uuid:., flow:$flow, tls:$tls, transport:$transport}
+        | with_entries(select(.value != null and .value != ""))
+    '
+}
+
 # 用户凭据直接保存到 sing-box 入站的 users 数组。
 user_action() (
     local rows inbound type port choice index op name pass="" uuid="" flow="" entry count host
-    local pending="" backup="" record label sni pub sid action revision
+    local pending="" backup="" record label sni pub sid action revision link generated_name="" current_exit=""
     local -a options=()
     command -v flock >/dev/null || { err "请先安装 flock 工具"; return 1; }
     revision=$(sha256sum < "$CONFIG_PATH") || return 1
@@ -527,7 +656,9 @@ user_action() (
         | "  \(.key + 1)) \(.value.name // "现有账号（未命名）")"
     ' "$CONFIG_PATH" || return 1
     count=$(jq -er --argjson i "$inbound" '.inbounds[$i].users | length' "$CONFIG_PATH") || return 1
-    printf '\n  1) 新增用户\n  2) 查看用户链接\n  3) 删除用户\n  0) 返回\n请选择操作：'
+    printf '\n  1) 新增用户\n  2) 查看用户链接\n  3) 删除用户\n'
+    if [[ "$type" != tuic ]]; then printf '  4) 配置用户出口\n'; fi
+    printf '  0) 返回\n请选择操作：'
     IFS= read -r op || return 0
     case "$op" in
         0) return 0 ;;
@@ -555,7 +686,8 @@ user_action() (
             index="$count"
             action=add
             ;;
-        2|3)
+        2|3|4)
+            if [[ "$op" == 4 && "$type" == tuic ]]; then warn "该协议不支持配置用户出口"; return 0; fi
             if (( count == 0 )); then warn "此入站没有用户"; return 0; fi
             printf '请输入用户编号：'
             IFS= read -r index || return 0
@@ -571,6 +703,48 @@ user_action() (
                 [[ "$choice" =~ ^[Yy]$ ]] || return 0
                 action=delete
                 entry=null
+            elif [[ "$op" == 4 ]]; then
+                record=$(jq -ce --argjson i "$inbound" --argjson j "$index" '
+                    .inbounds[$i] | select(.tag | type == "string" and length > 0)
+                    | {tag, name:(.users[$j].name // "")}
+                ' "$CONFIG_PATH") || { warn "该入站没有可用的标签"; return 1; }
+                name=$(jq -r '.name' <<< "$record") || return 1
+                current_exit=$(jq -r --argjson i "$inbound" --argjson j "$index" '
+                    .inbounds[$i] as $in
+                    | ($in.users[$j].name // "") as $name
+                    | ("sb-user-exit:" + ([$in.tag, $name] | @base64)) as $tag
+                    | if any(.route.rules[]?; . == {inbound:[$in.tag],auth_user:[$name],action:"route",outbound:$tag})
+                      then [.outbounds[] | select(.tag == $tag) | "\(.type) · \(.server):\(.server_port)"][0] // ""
+                      else "" end
+                ' "$CONFIG_PATH") || return 1
+                printf '\n当前出口：%s\n' "${current_exit:-使用默认路由}"
+                printf '  1) 导入或更换出口\n  2) 恢复默认路由\n  0) 返回\n请选择：'
+                IFS= read -r choice || return 0
+                action=unbind
+                entry=null
+                case "$choice" in
+                    0) return 0 ;;
+                    1)
+                        printf '粘贴 vless:// 或 ss:// 链接（输入隐藏）：'
+                        IFS= read -rs link || return 0
+                        printf '\n'
+                        if ! entry=$(parse_user_outbound "$link" 2>/dev/null); then
+                            warn "链接格式无效，或传输方式、加密参数暂不支持"
+                            return 1
+                        fi
+                        unset link
+                        if [[ -z "$name" ]]; then
+                            generated_name=$(rand_uuid) || return 1
+                            generated_name="sb-user-$generated_name"
+                        fi
+                        action=bind
+                        ;;
+                    2) [[ -n "$current_exit" ]] || return 0 ;;
+                    *) warn "无效选项"; return 0 ;;
+                esac
+                printf '应用出口配置并重启服务？[y/N]：'
+                IFS= read -r choice || return 0
+                [[ "$choice" =~ ^[Yy]$ ]] || return 0
             fi
             ;;
         *) warn "无效选项"; return 0 ;;
@@ -585,12 +759,53 @@ user_action() (
             err "配置刚刚被修改，请重试"
             return 1
         fi
-        jq -e --argjson i "$inbound" --argjson j "$index" --slurpfile user <(printf '%s\n' "$entry") --arg op "$action" '
-            if $op == "add" then .inbounds[$i].users += $user
-            else del(.inbounds[$i].users[$j])
+        jq -e --argjson i "$inbound" --argjson j "$index" --slurpfile data <(printf '%s\n' "$entry") \
+            --arg generated_name "$generated_name" --arg op "$action" '
+            def route_for($in; $name; $tag):
+                {inbound:[$in],auth_user:[$name],action:"route",outbound:$tag};
+            def remove_binding($rule):
+                if any(.route.rules[]?; . == $rule) then
+                    .route.rules |= map(select(. != $rule))
+                    | .outbounds |= map(select(.tag != $rule.outbound))
+                else . end;
+            def add_domain_resolver($out):
+                if ($out.server | contains(":") or test("^[0-9.]+$")) then .
+                elif .route.default_domain_resolver != null then .
+                elif (.dns.servers // [] | length) == 1 then .
+                else
+                    if any(.dns.servers[]?; .tag == "sb-user-exit-dns" and .type != "local")
+                    then error("用户出口 DNS 标签已被占用") else . end
+                    | if any(.dns.servers[]?; .tag == "sb-user-exit-dns") then .
+                      else .dns.servers = ((.dns.servers // []) + [{type:"local",tag:"sb-user-exit-dns"}])
+                      end
+                    | .outbounds[-1].domain_resolver = "sb-user-exit-dns"
+                end;
+            if $op == "add" then .inbounds[$i].users += $data
+            else
+                .inbounds[$i] as $in
+                | ($in.users[$j].name // "") as $original_name
+                | (if $original_name == "" then $generated_name else $original_name end) as $name
+                | ("sb-user-exit:" + ([$in.tag, $name] | @base64)) as $tag
+                | route_for($in.tag; $name; $tag) as $rule
+                | remove_binding($rule)
+                | if $op == "delete" then del(.inbounds[$i].users[$j])
+                  elif $op == "bind" then
+                      if $name == "" or ($in.tag // "") == "" or
+                          ([.inbounds[] | select(.tag == $in.tag)] | length) != 1 or
+                          ([$in.users[] | select(.name == $name)] | length) > (if $original_name == "" then 0 else 1 end) or
+                          any(.outbounds[]?; .tag == $tag)
+                      then error("入站、用户名或出口标签冲突") else . end
+                      | .inbounds[$i].users[$j].name = $name
+                      | .outbounds += [$data[0] + {tag:$tag}]
+                      | .route.rules = ([$rule] + (.route.rules // []))
+                      | add_domain_resolver($data[0])
+                  else . end
             end
         ' "$backup" > "$pending" || return 1
-        sing-box check -c "$pending" || { err "新配置校验失败，原配置保留"; return 1; }
+        if ! sing-box check -c "$pending" >/dev/null 2>&1; then
+            err "新配置校验失败，请核对协议参数和 sing-box 版本。原配置已保留。"
+            return 1
+        fi
         if ! cmp -s "$backup" "$CONFIG_PATH"; then err "配置刚刚被修改，请重试"; return 1; fi
         mv -f "$pending" "$CONFIG_PATH" || return 1
         if ! (service_restart && sleep 1 && service_status >/dev/null 2>&1); then
@@ -604,6 +819,7 @@ user_action() (
             return 1
         fi
         if [[ "$op" == 3 ]]; then info "用户已删除"; return 0; fi
+        if [[ "$op" == 4 ]]; then info "用户出口已更新"; return 0; fi
         info "已新增用户 $name"
     fi
 
